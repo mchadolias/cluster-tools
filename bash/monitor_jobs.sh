@@ -121,37 +121,17 @@ command -v python3 &>/dev/null || die "python3 is required."
 
 # --------------------------------------------------------------------------- #
 # Resolve results directory
-# Priority: CLI --results-dir  >  config 'paths.parquet_dir' (parent of)
 # --------------------------------------------------------------------------- #
+PIPELINE_CONFIG="$(dirname "${BASH_SOURCE[0]}")/../scripts/pipeline_config.py"
+[[ -f "$PIPELINE_CONFIG" ]] || die "pipeline_config.py not found at $PIPELINE_CONFIG"
+
 if [[ -z "$RESULTS_DIR" ]]; then
-    RESULTS_DIR=$(python3 - "$CONFIG" <<'PYEOF'
-import sys, os
-import yaml
-
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-
-# Resolve {detector_id} / {base_dir} placeholders the same way the Snakefile does
-det_id = cfg.get("detector_id", "")
-base_dir = (cfg.get("base_dir", "") or "").format(detector_id=det_id)
-vars_ = {"detector_id": det_id, "base_dir": base_dir}
-
-paths = cfg.get("paths", {}) or {}
-parquet_dir = paths.get("parquet_dir", "")
-try:
-    parquet_dir = parquet_dir.format(**vars_)
-except (KeyError, IndexError):
-    pass
-
-# results dir = parent of parquet_dir (e.g. results/KM3NeT_00000117)
-print(os.path.dirname(parquet_dir) if parquet_dir else "")
-PYEOF
-)
+    RESULTS_DIR=$(python3 "$PIPELINE_CONFIG" -c "$CONFIG" results-dir) \
+        || die "Failed to resolve results dir from $CONFIG."
     [[ -z "$RESULTS_DIR" ]] && die \
         "Could not infer results directory from $CONFIG. Pass -d <dir>."
 fi
 
-[[ -d "$RESULTS_DIR" ]] || warn "Results dir does not exist yet: $RESULTS_DIR"
 
 # --------------------------------------------------------------------------- #
 # Auto-detect scheduler
@@ -174,20 +154,8 @@ esac
 # --------------------------------------------------------------------------- #
 # Parse samples + n_jobs from config
 # --------------------------------------------------------------------------- #
-SAMPLE_INFO=$(python3 - "$CONFIG" <<'PYEOF'
-import sys, yaml
-
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-
-default_n = int(cfg.get("n_jobs", 4))
-samples = cfg.get("samples") or {}
-for name, body in samples.items():
-    body = body or {}
-    n = int(body.get("n_jobs", default_n))
-    print(f"{name} {n}")
-PYEOF
-)
+SAMPLE_INFO=$(python3 "$PIPELINE_CONFIG" -c "$CONFIG" samples --format njobs) \
+    || die "Failed to parse samples from $CONFIG."
 
 [[ -z "$SAMPLE_INFO" ]] && die "No samples found in $CONFIG."
 
@@ -202,15 +170,6 @@ done <<< "$SAMPLE_INFO"
 # --------------------------------------------------------------------------- #
 # Filesystem probe
 #
-# Populates: STATE_COUNTS["<rule>|<sample>|<state>"]  for state in D/R/F/P
-# Per-rule expected work units:
-#   prepare       1 unit per sample              (output: manifests/<sample>/)
-#   discover      |trees| units per sample       (output: aliases/<sample>/<T>_aliases.json)
-#   convert       n_jobs units per sample        (output: parquet/<sample>/chunk_N.parquet)
-#   validate      1 unit per sample              (output: parquet/<sample>/_validated)
-#   ml_manifest   1 per dataset (treated as a "synthetic sample")
-#   metadata      1 per dataset
-#
 # Running detection here is filesystem-only (mtime). The queue probe later
 # upgrades units from F→R when there's a queue entry that matches.
 # --------------------------------------------------------------------------- #
@@ -222,23 +181,10 @@ LOG_DIR="$RESULTS_DIR/logs"
 ML_DIR="$RESULTS_DIR/ml"
 
 # Trees and ML datasets, also from config.
-TREES_DATASETS=$(python3 - "$CONFIG" <<'PYEOF'
-import sys, yaml
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-print("TREES " + " ".join(cfg.get("trees", ["E", "T"])))
-ml = (cfg.get("ml") or {}).get("datasets") or {}
-print("DATASETS " + " ".join(ml.keys()))
-PYEOF
-)
 declare -a TREES=()
 declare -a DATASETS=()
-while IFS= read -r line; do
-    case "$line" in
-        TREES*)    read -ra TREES    <<< "${line#TREES }"    ;;
-        DATASETS*) read -ra DATASETS <<< "${line#DATASETS }" ;;
-    esac
-done <<< "$TREES_DATASETS"
+mapfile -t TREES    < <(python3 "$PIPELINE_CONFIG" -c "$CONFIG" trees       --format lines)
+mapfile -t DATASETS < <(python3 "$PIPELINE_CONFIG" -c "$CONFIG" ml-datasets --format lines)
 
 declare -A STATE_COUNTS=()       # "<rule>|<sample>|<state>" -> count
 declare -A STATE_TOTAL=()        # "<rule>|<sample>"         -> expected total

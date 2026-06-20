@@ -96,40 +96,15 @@ DIRECTORY="${POSITIONAL[0]}"
 command -v python3 &>/dev/null || die "python3 is required to parse YAML."
 
 # --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
 # Parse samples block from YAML
-# Emits one line per sample: <sample_name>:<identifier1>:<identifier2>:...
-# Uses PyYAML (already a transitive dep of km3tpi via metadata.py).
 # --------------------------------------------------------------------------- #
 log "Parsing samples from: $CONFIG"
 
-SAMPLE_DEFS=$(python3 - "$CONFIG" <<'PYEOF'
-import sys
-try:
-    import yaml
-except ImportError:
-    sys.stderr.write(
-        "ERROR: PyYAML is required (it's a transitive dep of km3tpi).\n"
-        "       pip install pyyaml  —or—  conda install pyyaml\n"
-    )
-    sys.exit(1)
+PIPELINE_CONFIG="$(dirname "${BASH_SOURCE[0]}")/../scripts/pipeline_config.py"
+[[ -f "$PIPELINE_CONFIG" ]] || die "pipeline_config.py not found at $PIPELINE_CONFIG"
 
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f) or {}
-
-samples = cfg.get("samples") or {}
-if not isinstance(samples, dict):
-    sys.stderr.write("ERROR: 'samples' block is not a mapping.\n")
-    sys.exit(1)
-
-for name, body in samples.items():
-    body = body or {}
-    ids = body.get("identifiers") or []
-    if not isinstance(ids, list):
-        ids = [ids]
-    print(f"{name}:" + ":".join(str(i) for i in ids))
-PYEOF
-)
+SAMPLE_DEFS=$(python3 "$PIPELINE_CONFIG" -c "$CONFIG" samples --format kv) \
+    || die "Failed to parse $CONFIG (see pipeline_config.py output above)."
 
 [[ -z "$SAMPLE_DEFS" ]] && die "No samples found in $CONFIG. Check the 'samples:' block format."
 
