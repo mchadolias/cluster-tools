@@ -39,10 +39,11 @@ N_FILES=""          # absolute number of files to sample
 FRACTION=""         # fraction of files to sample (0 < f <= 1)
 N_RUNS=""           # number of runs to sample (transfers all files for those runs)
 RUN_IDS=""          # path to a file with run IDs, or a 'START-END' range
+LIST_FILE=""        # path to a file with explicit filenames/events to transfer
 PATTERN="*"         # glob/filter pattern for file selection
 SEED=""             # optional random seed for reproducibility
 DRY_RUN=false
-VERBOSE=false
+VERBOSE=0            # verbosity level: 0=progress bar, 1=per-file, 2=full detail
 RECURSIVE=false
 RSYNC_OPTS="-az --progress"
 XRDCP_OPTS="--parallel 4"
@@ -89,6 +90,56 @@ seeded_sample() {
     printf '%s\n' "${lines[@]:0:$n}"
 }
 
+# Format a duration in seconds as MM:SS (or H:MM:SS past an hour).
+fmt_hms() {
+    local s=$1 h m
+    (( s < 0 )) && s=0
+    h=$(( s / 3600 )); m=$(( (s % 3600) / 60 )); s=$(( s % 60 ))
+    if (( h > 0 )); then printf '%d:%02d:%02d' "$h" "$m" "$s"
+    else printf '%02d:%02d' "$m" "$s"; fi
+}
+
+# Draw a tqdm-style progress bar to stderr (in place, via carriage return).
+# args: current total start_epoch
+draw_progress() {
+    local cur=$1 total=$2 start=$3
+    (( total <= 0 )) && total=1
+    (( cur > total )) && cur=$total
+
+    local width=30
+    local pct=$(( cur * 100 / total ))
+    # Work in eighths of a cell so the leading edge can be a partial block.
+    local eighths=$(( cur * width * 8 / total ))
+    local full=$(( eighths / 8 ))
+    local rem=$(( eighths % 8 ))
+    local parts=(' ' '▏' '▎' '▍' '▌' '▋' '▊' '▉')
+
+    local bar="" i
+    for ((i = 0; i < full; i++)); do bar+="█"; done
+    if (( full < width )); then
+        if (( rem > 0 )); then bar+="${parts[rem]}"; i=$(( full + 1 ))
+        else i=$full; fi
+        for (( ; i < width; i++ )); do bar+=" "; done
+    fi
+
+    local now elapsed eta_str rate_str
+    now=$(date +%s)
+    elapsed=$(( now - start ))
+    if (( elapsed > 0 && cur > 0 )); then
+        local rate_x10=$(( cur * 10 / elapsed ))
+        rate_str=$(printf '%d.%d' $(( rate_x10 / 10 )) $(( rate_x10 % 10 )))
+        eta_str=$(fmt_hms "$(( (total - cur) * elapsed / cur ))")
+    else
+        rate_str="0.0"; eta_str="??:??"
+    fi
+
+    # Local ESC sequences (the colour vars use echo -e style, not printf-safe).
+    local c=$'\033[0;36m' rst=$'\033[0m' clr=$'\033[K'
+    printf '\r%s|%s|%s %3d%% %d/%d [%s<%s, %s file/s]%s' \
+        "$c" "$bar" "$rst" "$pct" "$cur" "$total" \
+        "$(fmt_hms "$elapsed")" "$eta_str" "$rate_str" "$clr" >&2
+}
+
 # --------------------------------------------------------------------------- #
 # Usage
 # --------------------------------------------------------------------------- #
@@ -109,13 +160,21 @@ ${BOLD}OPTIONS${RESET}
                           • a path to a text file with one ID per line ('#' comments OK), or
                           • a numeric range 'START-END' (inclusive on both ends),
                             e.g. '12340-12350'.
-                       The four selection modes (-n, -f, --run, --run-ids) are mutually
-                       exclusive.
+  -L, --list FILE      Transfer exactly the files listed in FILE — one filename per
+                       line ('#' comments and blank lines ignored, whitespace trimmed).
+                       Each entry is matched against the source listing by basename
+                       (a full path is also accepted and matched exactly). Useful for
+                       transferring a hand-picked set of events. Seed is ignored.
+                       The five selection modes (-n, -f, --run, --run-ids, --list) are
+                       mutually exclusive.
   -p, --pattern GLOB   File pattern to match, default: '*'
   -s, --seed INT       Random seed for reproducibility (ignored with --run-ids)
   -r, --recursive      Recurse into subdirectories (local/SSH sources)
       --dry-run        Print actions without executing transfers
-  -v, --verbose        Verbose output
+  -v, --verbose        Increase verbosity (repeatable). Default (no -v) shows a
+                       progress bar; -v logs each file's name as it transfers;
+                       -vv additionally shows the full source→dest URI and the
+                       underlying transfer command.
   -l, --log FILE       Append transfer log to FILE
   -h, --help           Show this help
 
@@ -145,6 +204,10 @@ ${BOLD}EXAMPLES${RESET}
   $(basename "$0") --run-ids 12340-12350 -p "*.root" \\
       /data/km3net/raw /scratch/sample
 
+  # Transfer exactly the files named in list.txt
+  $(basename "$0") --list list.txt \\
+      root://xrootd.km3net.de//km3net/data/raw /scratch/sample
+
   # Dry-run to verify selection
   $(basename "$0") -n 50 --dry-run /data/km3net/raw /tmp/sample
 EOF
@@ -160,11 +223,14 @@ while [[ $# -gt 0 ]]; do
         -f|--fraction)  FRACTION="$2";  shift 2 ;;
         --run|--n-runs) N_RUNS="$2";    shift 2 ;;
         --run-ids)      RUN_IDS="$2";   shift 2 ;;
+        -L|--list)      LIST_FILE="$2"; shift 2 ;;
         -p|--pattern)   PATTERN="$2";   shift 2 ;;
         -s|--seed)      SEED="$2";      shift 2 ;;
         -r|--recursive) RECURSIVE=true; shift   ;;
         --dry-run)      DRY_RUN=true;   shift   ;;
-        -v|--verbose)   VERBOSE=true;   shift   ;;
+        -v|--verbose)   VERBOSE=$((VERBOSE + 1)); shift ;;
+        -vv)            VERBOSE=$((VERBOSE + 2)); shift ;;
+        -vvv)           VERBOSE=$((VERBOSE + 3)); shift ;;
         -l|--log)       LOG_FILE="$2";  shift 2 ;;
         -h|--help)      usage; exit 0           ;;
         -*)             die "Unknown option: $1" ;;
@@ -176,19 +242,24 @@ done
 SOURCE="${POSITIONAL[0]}"
 DEST="${POSITIONAL[1]}"
 
-# Selection-mode validation: exactly one of -n / -f / --run / --run-ids
+# Selection-mode validation: exactly one of -n / -f / --run / --run-ids / --list
 n_modes=0
 [[ -n "$N_FILES"  ]] && n_modes=$((n_modes + 1))
 [[ -n "$FRACTION" ]] && n_modes=$((n_modes + 1))
 [[ -n "$N_RUNS"   ]] && n_modes=$((n_modes + 1))
 [[ -n "$RUN_IDS"  ]] && n_modes=$((n_modes + 1))
+[[ -n "$LIST_FILE" ]] && n_modes=$((n_modes + 1))
 
-(( n_modes == 0 )) && die "Specify selection with -n <count>, -f <fraction>, --run <N>, or --run-ids <arg>."
-(( n_modes >  1 )) && die "Use only one of -n / -f / --run / --run-ids."
+(( n_modes == 0 )) && die "Specify selection with -n <count>, -f <fraction>, --run <N>, --run-ids <arg>, or --list <file>."
+(( n_modes >  1 )) && die "Use only one of -n / -f / --run / --run-ids / --list."
 
 if [[ -n "$N_RUNS" ]]; then
     [[ "$N_RUNS" =~ ^[0-9]+$ && "$N_RUNS" -gt 0 ]] \
         || die "--run: expected a positive integer, got '$N_RUNS'."
+fi
+
+if [[ -n "$LIST_FILE" ]]; then
+    [[ -f "$LIST_FILE" ]] || die "--list: file '$LIST_FILE' does not exist."
 fi
 
 if [[ -n "$RUN_IDS" ]]; then
@@ -247,6 +318,21 @@ if [[ -n "$RUN_IDS" ]]; then
         RUN_IDS_SOURCE="file"
         log "Loaded ${BOLD}${#IDS[@]}${RESET} run ID(s) from $RUN_IDS"
     fi
+fi
+
+# --------------------------------------------------------------------------- #
+# Load explicit filename list (if given) — matched by basename after listing
+# --------------------------------------------------------------------------- #
+WANTED_NAMES=()
+if [[ -n "$LIST_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"                              # strip '#' comments
+        line="${line#"${line%%[![:space:]]*}"}"         # ltrim
+        line="${line%"${line##*[![:space:]]}"}"         # rtrim
+        [[ -n "$line" ]] && WANTED_NAMES+=("$line")
+    done < "$LIST_FILE"
+    [[ ${#WANTED_NAMES[@]} -eq 0 ]] && die "No filenames found in $LIST_FILE"
+    log "Loaded ${BOLD}${#WANTED_NAMES[@]}${RESET} filename(s) from $LIST_FILE"
 fi
 
 
@@ -334,9 +420,52 @@ if [[ -n "$N_RUNS" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Selection: full match-set by run IDs OR random sample of N / fraction files
+# Selection: explicit list OR full match-set by run IDs OR random sample
 # --------------------------------------------------------------------------- #
-if [[ ${#IDS[@]} -gt 0 ]]; then
+if [[ ${#WANTED_NAMES[@]} -gt 0 ]]; then
+    declare -A AVAIL=()
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        AVAIL["$f"]=1            # full path as listed
+        AVAIL["${f##*/}"]=1      # basename
+    done <<< "$ALL_FILES"
+
+    # For each source file, keep it if its path or basename was requested.
+    declare -A REQUESTED=()
+    for name in "${WANTED_NAMES[@]}"; do
+        REQUESTED["$name"]=1
+        REQUESTED["${name##*/}"]=1   # tolerate paths in the list file
+    done
+
+    SELECTED=$(
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            if [[ -n "${REQUESTED[$f]:-}" || -n "${REQUESTED[${f##*/}]:-}" ]]; then
+                echo "$f"
+            fi
+        done <<< "$ALL_FILES"
+    )
+    SAMPLE_N=$(echo "$SELECTED" | grep -c . || true)
+
+    [[ "$SAMPLE_N" -eq 0 ]] && die "None of the ${#WANTED_NAMES[@]} listed file(s) were found in source."
+
+    # Warn about listed entries that matched nothing in the source.
+    missing=()
+    for name in "${WANTED_NAMES[@]}"; do
+        if [[ -z "${AVAIL[$name]:-}" && -z "${AVAIL[${name##*/}]:-}" ]]; then
+            missing+=("$name")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        if (( ${#missing[@]} <= 20 )); then
+            warn "Listed file(s) not found in source (${#missing[@]}): ${missing[*]}"
+        else
+            warn "Listed file(s) not found in source: ${#missing[@]} of ${#WANTED_NAMES[@]} (first 20: ${missing[*]:0:20}…)"
+        fi
+    fi
+
+    log "Matched ${BOLD}${SAMPLE_N}${RESET} file(s) from the list of ${#WANTED_NAMES[@]}."
+elif [[ ${#IDS[@]} -gt 0 ]]; then
     # Build extended-regex alternation: id1|id2|id3 — escape any regex metas in IDs
     esc_ids=()
     for id in "${IDS[@]}"; do
@@ -349,10 +478,6 @@ if [[ ${#IDS[@]} -gt 0 ]]; then
 
     [[ "$SAMPLE_N" -eq 0 ]] && die "No files matched any of the ${#IDS[@]} run ID(s)."
 
-    # Identify run IDs that produced no match — useful for typos in files
-    # and for detecting gaps in a range.  Single-pass: extract matched IDs
-    # from filenames, set-diff against the requested IDs.
-    matched_ids=$(echo "$SELECTED" | grep -oE "$ID_RE" | sort -u)
     missing=$(comm -23 \
         <(printf '%s\n' "${IDS[@]}" | sort -u) \
         <(echo "$matched_ids"))
@@ -384,7 +509,7 @@ else
     SELECTED=$(echo "$ALL_FILES" | seeded_sample "$SEED" "$SAMPLE_N")
 fi
 
-if $VERBOSE; then
+if (( VERBOSE >= 2 )); then
     log "Selected files:"
     echo "$SELECTED" | while read -r f; do echo "  $f"; done
 fi
@@ -395,6 +520,11 @@ fi
 TRANSFERRED=0
 FAILED=0
 START_TIME=$(date +%s)
+
+_exec() {
+    (( VERBOSE >= 2 )) && log "  \$ $*"
+    if $SHOW_BAR; then "$@" >/dev/null; else "$@"; fi
+}
 
 transfer_file() {
     local file="$1"
@@ -423,29 +553,53 @@ transfer_file() {
             local)  dst_uri="${DEST%/}/$(basename "$file")" ;;
             ssh)    dst_uri="${DEST}" ;;  # pipe through local for ssh dst
         esac
-        xrdcp $XRDCP_OPTS "$src_uri" "$dst_uri"
+        _exec xrdcp $XRDCP_OPTS "$src_uri" "$dst_uri"
     elif [[ "$SRC_TYPE" == "local" && "$DST_TYPE" == "local" ]]; then
         mkdir -p "$DEST"
-        cp "$file" "${DEST%/}/"
+        _exec cp "$file" "${DEST%/}/"
     else
         # SSH source or SSH dest: use rsync
-        rsync $RSYNC_OPTS "$src_uri" "$DEST"
+        _exec rsync $RSYNC_OPTS "$src_uri" "$DEST"
     fi
 }
 
+# Decide presentation: progress bar only at level 0 and not during a dry-run.
+SHOW_BAR=false
+if (( VERBOSE == 0 )) && ! $DRY_RUN; then
+    SHOW_BAR=true
+    # Silence per-file tool chatter so it doesn't fight the overall bar.
+    RSYNC_OPTS="${RSYNC_OPTS//--progress/} -q"
+    XRDCP_OPTS="$XRDCP_OPTS -s"
+fi
+
 log "Starting transfer…"
-echo "$SELECTED" | while IFS= read -r file; do
+DONE=0
+$SHOW_BAR && draw_progress 0 "$SAMPLE_N" "$START_TIME"
+
+while IFS= read -r file; do
     [[ -z "$file" ]] && continue
-    $VERBOSE && log "Transferring: $file"
+
+    if ! $DRY_RUN; then
+        if   (( VERBOSE >= 2 )); then log "Transferring: $file"
+        elif (( VERBOSE == 1 )); then log "Transferring: ${file##*/}"
+        fi
+    fi
+
     if transfer_file "$file"; then
         TRANSFERRED=$((TRANSFERRED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) OK  $file" >> "$LOG_FILE"
     else
-        warn "Failed: $file"
+        $SHOW_BAR && printf '\n' >&2   # break the bar line before the warning
+        warn "Failed: ${file##*/}"
         FAILED=$((FAILED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) ERR $file" >> "$LOG_FILE"
     fi
-done
+
+    DONE=$((DONE + 1))
+    $SHOW_BAR && draw_progress "$DONE" "$SAMPLE_N" "$START_TIME"
+done <<< "$SELECTED"
+
+$SHOW_BAR && printf '\n' >&2
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
@@ -461,6 +615,9 @@ $DRY_RUN && echo -e " Mode        : ${YELLOW}DRY RUN${RESET}"
 echo    " Source      : $SOURCE  (${SRC_TYPE})"
 echo    " Destination : $DEST  (${DST_TYPE})"
 echo    " Pattern     : $PATTERN"
+if [[ -n "$LIST_FILE" ]]; then
+    echo " File list   : ${#WANTED_NAMES[@]} requested (file: $LIST_FILE)"
+fi
 if [[ ${#IDS[@]} -gt 0 ]]; then
     case "$RUN_IDS_SOURCE" in
         range)   echo " Run IDs     : ${#IDS[@]} (range: $RUN_IDS)" ;;

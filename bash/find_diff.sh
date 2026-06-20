@@ -12,6 +12,13 @@
 # Checksums are only computed for files that pass the size-match check,
 # so the cost is proportional to the number of candidates, not all files.
 #
+# Output:
+#   --list FILE      writes one annotated report covering every category.
+#   --split-dir DIR  writes one clean filename-per-line list per category
+#                    (only_in_<A>.txt, only_in_<B>.txt, size_mismatch.txt,
+#                    content_mismatch.txt, identical.txt, all_diffs.txt).
+#                    These are directly consumable by 'transfer_data.sh --list'.
+#
 # Usage:
 #   diff_dirs.sh [OPTIONS] <dir_a> <dir_b>
 #
@@ -20,6 +27,8 @@
 #   diff_dirs.sh -p "*.root" --hash sha256 --list diff.txt \
 #       /data/km3net/raw /scratch/sample
 #   diff_dirs.sh --no-checksum --csv -o report.csv \
+#       /data/km3net/raw /scratch/sample
+#   diff_dirs.sh -p "*.root" --split-dir diff_lists \
 #       /data/km3net/raw /scratch/sample
 # =============================================================================
 
@@ -41,6 +50,7 @@ die()  { err "$*"; exit 1; }
 # --------------------------------------------------------------------------- #
 PATTERN="*"
 LIST_FILE=""
+SPLIT_DIR=""
 CSV_OUT=false
 OUTPUT_FILE=""
 LABEL_A="DIR_A"
@@ -65,6 +75,11 @@ ${BOLD}OPTIONS${RESET}
       --hash ALG         Checksum algorithm: md5 or sha256 (default: md5)
       --no-checksum      Skip checksum step (size comparison only)
       --list FILE        Write the full diff file list to FILE
+  -S, --split-dir DIR    Also write one clean filename-per-line list per category
+                         into DIR (only_in_<A>.txt, only_in_<B>.txt,
+                         size_mismatch.txt, content_mismatch.txt, identical.txt,
+                         plus all_diffs.txt). These are directly consumable by
+                         'transfer_data.sh --list'.
       --csv              Print summary as CSV instead of table
   -o, --output FILE      Write CSV report to FILE
   -h, --help             Show this help
@@ -74,6 +89,11 @@ ${BOLD}EXAMPLES${RESET}
   $(basename "$0") -p "*.root" --hash sha256 -A source -B dest \\
       --list diff.txt /data/km3net/raw /scratch/sample
   $(basename "$0") --no-checksum --csv -o report.csv \\
+      /data/km3net/raw /scratch/sample
+  # Per-category lists, then re-transfer everything missing/different:
+  $(basename "$0") -p "*.root" -A source -B dest \\
+      --split-dir diff_lists /data/km3net/raw /scratch/sample
+  transfer_data.sh --list diff_lists/only_in_source.txt \\
       /data/km3net/raw /scratch/sample
 EOF
 }
@@ -90,6 +110,7 @@ while [[ $# -gt 0 ]]; do
         --hash)           HASH_ALG="$2";     shift 2 ;;
         --no-checksum)    DO_CHECKSUM=false;  shift   ;;
         --list)           LIST_FILE="$2";    shift 2 ;;
+        -S|--split-dir)   SPLIT_DIR="$2";    shift 2 ;;
         --csv)            CSV_OUT=true;      shift   ;;
         -o|--output)      OUTPUT_FILE="$2";  shift 2 ;;
         -h|--help)        usage; exit 0              ;;
@@ -364,6 +385,72 @@ render_list() {
     done
     [[ "$N_IDENTICAL" -eq 0 ]] && echo "# (none)"
     } > "$out"
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
+# Per-category clean lists (one filename per line, no decoration)
+# Each file is directly consumable by `transfer_data.sh --list`.
+# --------------------------------------------------------------------------- #
+# Make a filesystem-safe slug from a label (for the only_in_<label> filenames).
+slug() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g'
+}
+
+# Write an array (passed as args) to a file, one item per line. Empty array
+# produces a genuinely empty file rather than a stray blank line.
+_write_list() {
+    local out="$1"; shift
+    if (( $# == 0 )); then
+        : > "$out"
+    else
+        printf '%s\n' "$@" > "$out"
+    fi
+}
+
+write_split_lists() {
+    local dir="$1"
+    mkdir -p "$dir" || die "Cannot create split-list directory: $dir"
+
+    local sa sb
+    sa=$(slug "$LABEL_A")
+    sb=$(slug "$LABEL_B")
+    # Guard against both labels slugging to the same name.
+    [[ "$sa" == "$sb" ]] && { sa="a_${sa}"; sb="b_${sb}"; }
+
+    _write_list "$dir/only_in_${sa}.txt"   "${ONLY_A[@]+"${ONLY_A[@]}"}"
+    _write_list "$dir/only_in_${sb}.txt"   "${ONLY_B[@]+"${ONLY_B[@]}"}"
+    _write_list "$dir/size_mismatch.txt"   "${SIZE_MISMATCH[@]+"${SIZE_MISMATCH[@]}"}"
+    if $DO_CHECKSUM; then
+        _write_list "$dir/content_mismatch.txt" "${CONTENT_MISMATCH[@]+"${CONTENT_MISMATCH[@]}"}"
+    fi
+    _write_list "$dir/identical.txt"       "${IDENTICAL[@]+"${IDENTICAL[@]}"}"
+
+    # Combined list of everything that differs (sorted, de-duplicated).
+    local all_diffs
+    all_diffs=$(
+        printf '%s\n' \
+            "${ONLY_A[@]+"${ONLY_A[@]}"}" \
+            "${ONLY_B[@]+"${ONLY_B[@]}"}" \
+            "${SIZE_MISMATCH[@]+"${SIZE_MISMATCH[@]}"}" \
+            "${CONTENT_MISMATCH[@]+"${CONTENT_MISMATCH[@]}"}" \
+            | grep -v '^$' | sort -u || true
+    )
+    if [[ -n "$all_diffs" ]]; then
+        printf '%s\n' "$all_diffs" > "$dir/all_diffs.txt"
+    else
+        : > "$dir/all_diffs.txt"
+    fi
+
+    log "Split lists written to ${BOLD}${dir}/${RESET}:"
+    log "  only_in_${sa}.txt     (${N_ONLY_A})"
+    log "  only_in_${sb}.txt     (${N_ONLY_B})"
+    log "  size_mismatch.txt      (${N_SIZE_MISMATCH})"
+    $DO_CHECKSUM && \
+    log "  content_mismatch.txt   (${N_CONTENT_MISMATCH})"
+    log "  identical.txt          (${N_IDENTICAL})"
+    log "  all_diffs.txt          (${N_TOTAL_DIFF})"
+    return 0
 }
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +483,10 @@ if [[ -n "$LIST_FILE" ]]; then
     log "Diff file list written to: $LIST_FILE"
 else
     render_list /dev/stdout
+fi
+
+if [[ -n "$SPLIT_DIR" ]]; then
+    write_split_lists "$SPLIT_DIR"
 fi
 
 # Exit non-zero if diffs found (useful for CI / Snakemake guards)
