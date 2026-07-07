@@ -1,33 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# sample_transfer.sh — Random file sampler & transfer for km3tipi pipelines
+# sample_transfer.sh — Random file/folder sampler & transfer for km3tipi
 #
-# Transfers a random sample of files from a source directory to a destination.
+# Transfers a random sample of files (or directories) from a source to a dest.
 # Supports local paths, remote SSH hosts, and XRootD (dcache) endpoints.
-#
-# Usage:
-#   sample_transfer.sh [OPTIONS] <source> <destination>
-#
-# Source/Destination formats:
-#   /local/path                         — local filesystem
-#   user@host:/remote/path              — SSH/rsync remote
-#   root://xrootd.example.org//path     — XRootD / dcache
-#
-# Examples:
-#   # 20 random files from dcache to local scratch
-#   sample_transfer.sh -n 20 -p "*.root" \
-#       root://xrootd.km3net.de//km3net/data/raw \
-#       /scratch/michalis/sample
-#
-#   # 10% of files from cluster home to another cluster
-#   sample_transfer.sh -f 0.10 \
-#       user@lyon:/data/km3net/dst \
-#       user@cnaf:/scratch/michalis/dst
-#
-#   # Dry-run: see what would be transferred
-#   sample_transfer.sh -n 50 --dry-run \
-#       /data/km3net/raw \
-#       /tmp/sample
 # =============================================================================
 
 set -euo pipefail
@@ -35,16 +11,17 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
-N_FILES=""          # absolute number of files to sample
-FRACTION=""         # fraction of files to sample (0 < f <= 1)
-N_RUNS=""           # number of runs to sample (transfers all files for those runs)
-RUN_IDS=""          # path to a file with run IDs, or a 'START-END' range
-LIST_FILE=""        # path to a file with explicit filenames/events to transfer
-PATTERN="*"         # glob/filter pattern for file selection
-SEED=""             # optional random seed for reproducibility
+N_FILES=""          
+FRACTION=""         
+N_RUNS=""           
+RUN_IDS=""          
+LIST_FILE=""        
+PATTERN="*"         
+SEED=""             
 DRY_RUN=false
-VERBOSE=0            # verbosity level: 0=progress bar, 1=per-file, 2=full detail
+VERBOSE=0           
 RECURSIVE=false
+DIRS_MODE=false
 RSYNC_OPTS="-az --progress"
 XRDCP_OPTS="--parallel 4"
 LOG_FILE=""
@@ -61,10 +38,6 @@ err()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 ok()   { echo -e "${GREEN}[OK]${RESET}    $*"; }
 die()  { err "$*"; exit 1; }
 
-# Seeded random sampling. Reads lines from stdin, prints up to N of them.
-# Deterministic for a given seed (uses bash $RANDOM, not awk srand which mawk
-# does not honour reproducibly across invocations). When seed is empty, falls
-# back to `shuf` for non-deterministic sampling.
 seeded_sample() {
     local seed="$1" n="$2"
     if [[ -z "$seed" ]]; then
@@ -80,7 +53,6 @@ seeded_sample() {
     (( n >= total )) && { printf '%s\n' "${lines[@]}"; return; }
     RANDOM="$seed"
     local i j tmp
-    # Partial Fisher-Yates: only shuffle the first n positions.
     for ((i = 0; i < n; i++)); do
         j=$(( RANDOM % (total - i) + i ))
         tmp="${lines[i]}"
@@ -90,7 +62,6 @@ seeded_sample() {
     printf '%s\n' "${lines[@]:0:$n}"
 }
 
-# Format a duration in seconds as MM:SS (or H:MM:SS past an hour).
 fmt_hms() {
     local s=$1 h m
     (( s < 0 )) && s=0
@@ -99,8 +70,6 @@ fmt_hms() {
     else printf '%02d:%02d' "$m" "$s"; fi
 }
 
-# Draw a tqdm-style progress bar to stderr (in place, via carriage return).
-# args: current total start_epoch
 draw_progress() {
     local cur=$1 total=$2 start=$3
     (( total <= 0 )) && total=1
@@ -108,7 +77,6 @@ draw_progress() {
 
     local width=30
     local pct=$(( cur * 100 / total ))
-    # Work in eighths of a cell so the leading edge can be a partial block.
     local eighths=$(( cur * width * 8 / total ))
     local full=$(( eighths / 8 ))
     local rem=$(( eighths % 8 ))
@@ -133,9 +101,8 @@ draw_progress() {
         rate_str="0.0"; eta_str="??:??"
     fi
 
-    # Local ESC sequences (the colour vars use echo -e style, not printf-safe).
     local c=$'\033[0;36m' rst=$'\033[0m' clr=$'\033[K'
-    printf '\r%s|%s|%s %3d%% %d/%d [%s<%s, %s file/s]%s' \
+    printf '\r%s|%s|%s %3d%% %d/%d [%s<%s, %s obj/s]%s' \
         "$c" "$bar" "$rst" "$pct" "$cur" "$total" \
         "$(fmt_hms "$elapsed")" "$eta_str" "$rate_str" "$clr" >&2
 }
@@ -145,71 +112,25 @@ draw_progress() {
 # --------------------------------------------------------------------------- #
 usage() {
 cat <<EOF
-${BOLD}sample_transfer.sh${RESET} — random file sampler & transfer for km3tipi
+${BOLD}sample_transfer.sh${RESET} — random file/folder sampler & transfer for km3tipi
 
 ${BOLD}USAGE${RESET}
   $(basename "$0") [OPTIONS] <source> <destination>
 
 ${BOLD}OPTIONS${RESET}
-  -n, --count N        Transfer exactly N files (mutually exclusive with the others)
-  -f, --fraction F     Transfer a fraction F of files, e.g. 0.10 for 10%
-      --run N          Pick N distinct runs at random from the source and transfer
-                       ALL files belonging to those runs. Run IDs are extracted from
-                       filenames as the last 4+ digit numeric token of the basename.
-      --run-ids ARG    Transfer all files whose names contain a run ID. ARG is either:
-                          • a path to a text file with one ID per line ('#' comments OK), or
-                          • a numeric range 'START-END' (inclusive on both ends),
-                            e.g. '12340-12350'.
-  -L, --list FILE      Transfer exactly the files listed in FILE — one filename per
-                       line ('#' comments and blank lines ignored, whitespace trimmed).
-                       Each entry is matched against the source listing by basename
-                       (a full path is also accepted and matched exactly). Useful for
-                       transferring a hand-picked set of events. Seed is ignored.
-                       The five selection modes (-n, -f, --run, --run-ids, --list) are
-                       mutually exclusive.
-  -p, --pattern GLOB   File pattern to match, default: '*'
-  -s, --seed INT       Random seed for reproducibility (ignored with --run-ids)
+  -n, --count N        Transfer exactly N items
+  -f, --fraction F     Transfer a fraction F of items, e.g. 0.10 for 10%
+      --run N          Pick N distinct runs at random from the source
+      --run-ids ARG    Transfer all items whose names contain a run ID
+  -L, --list FILE      Transfer exactly the items listed in FILE
+  -p, --pattern GLOB   Pattern to match, default: '*'
+  -d, --dirs           Sample and transfer entire directories instead of files
+  -s, --seed INT       Random seed for reproducibility
   -r, --recursive      Recurse into subdirectories (local/SSH sources)
       --dry-run        Print actions without executing transfers
-  -v, --verbose        Increase verbosity (repeatable). Default (no -v) shows a
-                       progress bar; -v logs each file's name as it transfers;
-                       -vv additionally shows the full source→dest URI and the
-                       underlying transfer command.
+  -v, --verbose        Increase verbosity (repeatable).
   -l, --log FILE       Append transfer log to FILE
   -h, --help           Show this help
-
-${BOLD}SOURCE / DESTINATION FORMATS${RESET}
-  /local/path                     Local filesystem
-  user@host:/remote/path          SSH / rsync remote
-  root://host//xrd/path           XRootD / dcache
-
-${BOLD}EXAMPLES${RESET}
-  # 20 random .root files from dcache to local
-  $(basename "$0") -n 20 -p "*.root" \\
-      root://xrootd.km3net.de//km3net/data/raw /scratch/sample
-
-  # 10% of DST files between two SSH clusters
-  $(basename "$0") -f 0.10 -p "*.dst.gz" \\
-      lyon:/data/km3net/dst cnaf:/scratch/michalis/dst
-      
-  # Transfer all files for 5 randomly selected runs
-  $(basename "$0") --run 5 -s 42 -p "*.root" \\
-      /data/km3net/raw /scratch/sample
-
-  # Transfer files matching run IDs from a list
-  $(basename "$0") --run-ids runs.txt \\
-      root://xrootd.km3net.de//km3net/data/raw /scratch/sample
-
-  # Transfer files for every run ID in a range (inclusive)
-  $(basename "$0") --run-ids 12340-12350 -p "*.root" \\
-      /data/km3net/raw /scratch/sample
-
-  # Transfer exactly the files named in list.txt
-  $(basename "$0") --list list.txt \\
-      root://xrootd.km3net.de//km3net/data/raw /scratch/sample
-
-  # Dry-run to verify selection
-  $(basename "$0") -n 50 --dry-run /data/km3net/raw /tmp/sample
 EOF
 }
 
@@ -225,6 +146,7 @@ while [[ $# -gt 0 ]]; do
         --run-ids)      RUN_IDS="$2";   shift 2 ;;
         -L|--list)      LIST_FILE="$2"; shift 2 ;;
         -p|--pattern)   PATTERN="$2";   shift 2 ;;
+        -d|--dirs)      DIRS_MODE=true; shift   ;;
         -s|--seed)      SEED="$2";      shift 2 ;;
         -r|--recursive) RECURSIVE=true; shift   ;;
         --dry-run)      DRY_RUN=true;   shift   ;;
@@ -242,7 +164,6 @@ done
 SOURCE="${POSITIONAL[0]}"
 DEST="${POSITIONAL[1]}"
 
-# Selection-mode validation: exactly one of -n / -f / --run / --run-ids / --list
 n_modes=0
 [[ -n "$N_FILES"  ]] && n_modes=$((n_modes + 1))
 [[ -n "$FRACTION" ]] && n_modes=$((n_modes + 1))
@@ -263,7 +184,6 @@ if [[ -n "$LIST_FILE" ]]; then
 fi
 
 if [[ -n "$RUN_IDS" ]]; then
-    # Accept either a START-END range or a path to an existing file.
     if [[ "$RUN_IDS" =~ ^[0-9]+-[0-9]+$ ]] || [[ -f "$RUN_IDS" ]]; then
         :
     else
@@ -276,12 +196,9 @@ fi
 # --------------------------------------------------------------------------- #
 detect_type() {
     local path="$1"
-    if [[ "$path" == root://* ]]; then
-        echo "xrootd"
-    elif [[ "$path" == *@*:* || "$path" == *:/* ]]; then
-        echo "ssh"
-    else
-        echo "local"
+    if [[ "$path" == root://* ]]; then echo "xrootd"
+    elif [[ "$path" == *@*:* || "$path" == *:/* ]]; then echo "ssh"
+    else echo "local"
     fi
 }
 
@@ -292,10 +209,10 @@ log "Source type : ${BOLD}${SRC_TYPE}${RESET}  →  ${SOURCE}"
 log "Dest type   : ${BOLD}${DST_TYPE}${RESET}  →  ${DEST}"
 
 # --------------------------------------------------------------------------- #
-# Load run IDs (if given) — applied as a post-listing filter, not a glob
+# Load run IDs (if given)
 # --------------------------------------------------------------------------- #
 IDS=()
-RUN_IDS_SOURCE=""        # "range" or "file" — for log messages
+RUN_IDS_SOURCE=""
 if [[ -n "$RUN_IDS" ]]; then
     if [[ "$RUN_IDS" =~ ^([0-9]+)-([0-9]+)$ ]]; then
         start="${BASH_REMATCH[1]}"
@@ -307,7 +224,6 @@ if [[ -n "$RUN_IDS" ]]; then
         RUN_IDS_SOURCE="range"
         log "Expanded range ${BOLD}${start}-${end}${RESET} → ${#IDS[@]} run ID(s)"
     else
-        # File: one ID per line, '#' comments + blank lines skipped, whitespace trimmed
         while IFS= read -r line || [[ -n "$line" ]]; do
             line="${line%%#*}"
             line="${line#"${line%%[![:space:]]*}"}"
@@ -321,72 +237,75 @@ if [[ -n "$RUN_IDS" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Load explicit filename list (if given) — matched by basename after listing
+# Load explicit list (if given)
 # --------------------------------------------------------------------------- #
 WANTED_NAMES=()
 if [[ -n "$LIST_FILE" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"                              # strip '#' comments
-        line="${line#"${line%%[![:space:]]*}"}"         # ltrim
-        line="${line%"${line##*[![:space:]]}"}"         # rtrim
+        line="${line%%#*}"                              
+        line="${line#"${line%%[![:space:]]*}"}"         
+        line="${line%"${line##*[![:space:]]}"}"         
         [[ -n "$line" ]] && WANTED_NAMES+=("$line")
     done < "$LIST_FILE"
     [[ ${#WANTED_NAMES[@]} -eq 0 ]] && die "No filenames found in $LIST_FILE"
     log "Loaded ${BOLD}${#WANTED_NAMES[@]}${RESET} filename(s) from $LIST_FILE"
 fi
 
-
-
 # --------------------------------------------------------------------------- #
-# List files from source
+# List items from source 
 # --------------------------------------------------------------------------- #
 list_files() {
     local src="$1" type="$2"
+    local item_type="f"
+    $DIRS_MODE && item_type="d"
+
     case "$type" in
         local)
             if $RECURSIVE; then
-                find "$src" -type f -name "$PATTERN"
+                # Added -mindepth 1 to prevent selecting the parent directory itself
+                find "$src" -mindepth 1 -type "$item_type" -name "$PATTERN"
             else
-                find "$src" -maxdepth 1 -type f -name "$PATTERN"
+                find "$src" -mindepth 1 -maxdepth 1 -type "$item_type" -name "$PATTERN"
             fi
             ;;
         ssh)
             local host="${src%%:*}"
             local path="${src#*:}"
             if $RECURSIVE; then
-                ssh "$host" "find '$path' -type f -name '$PATTERN'"
+                ssh "$host" "find '$path' -mindepth 1 -type '$item_type' -name '$PATTERN'"
             else
-                ssh "$host" "find '$path' -maxdepth 1 -type f -name '$PATTERN'"
+                ssh "$host" "find '$path' -mindepth 1 -maxdepth 1 -type '$item_type' -name '$PATTERN'"
             fi
             ;;
         xrootd)
-            # xrdfs ls, strip the XRD prefix to get the logical path
-            local server="${src%%//*}""//"  # e.g. root://xrootd.km3net.de//
-            local lpath="/${src#*//}"       # logical path after double-slash
+            local server="${src%%//*}""//" 
+            local lpath="/${src#*//}"       
             lpath="/${lpath#/}"
-            xrdfs "${server%//}" ls "$lpath" 2>/dev/null \
-                | grep -E "${PATTERN//\*/.*}" || true
+            
+            if $DIRS_MODE; then
+                # xrdfs ls doesn't include the parent dir by default, so we just filter
+                xrdfs "${server%//}" ls -l "$lpath" 2>/dev/null \
+                    | awk '/^d/ {print $NF}' | grep -E "${PATTERN//\*/.*}" || true
+            else
+                xrdfs "${server%//}" ls "$lpath" 2>/dev/null \
+                    | grep -E "${PATTERN//\*/.*}" || true
+            fi
             ;;
     esac
 }
 
-log "Listing files from source…"
-ALL_FILES=$(list_files "$SOURCE" "$SRC_TYPE") || die "Failed to list source files."
+log "Listing items from source…"
+ALL_FILES=$(list_files "$SOURCE" "$SRC_TYPE") || die "Failed to list source items."
 TOTAL=$(echo "$ALL_FILES" | grep -c . || true)
 
-[[ "$TOTAL" -eq 0 ]] && die "No files matching pattern '${PATTERN}' found in source."
-log "Found ${BOLD}${TOTAL}${RESET} matching file(s)."
+[[ "$TOTAL" -eq 0 ]] && die "No matching items found in source."
+log "Found ${BOLD}${TOTAL}${RESET} matching item(s)."
 
 # --------------------------------------------------------------------------- #
-# --run N : sample N distinct run IDs from filenames, populate IDS array
+# --run N : sample N distinct run IDs from filenames
 # --------------------------------------------------------------------------- #
 if [[ -n "$N_RUNS" ]]; then
-    log "Extracting run IDs from filenames…"
-
-    # Per-file: take the basename and find the LAST 4+ digit numeric token.
-    # KM3NeT convention puts the run_id after the det_id, so the last match is
-    # the one we want. We use bash's =~ rather than awk because mawk (the
-    # default `awk` on many cluster nodes) miscompiles `{4,}` as exactly 4.
+    log "Extracting run IDs from item names…"
     ALL_RUN_IDS=$(
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
@@ -402,8 +321,7 @@ if [[ -n "$N_RUNS" ]]; then
     )
 
     n_unique=$(echo "$ALL_RUN_IDS" | grep -c . || true)
-    [[ "$n_unique" -eq 0 ]] && die "Could not extract any run IDs from filenames. " \
-                                   "(Looked for the last 4+ digit token in each basename.)"
+    [[ "$n_unique" -eq 0 ]] && die "Could not extract any run IDs from filenames."
 
     log "Found ${BOLD}${n_unique}${RESET} distinct run ID(s) in source."
 
@@ -413,7 +331,6 @@ if [[ -n "$N_RUNS" ]]; then
     fi
 
     SELECTED_IDS=$(echo "$ALL_RUN_IDS" | seeded_sample "$SEED" "$N_RUNS")
-
     mapfile -t IDS < <(echo "$SELECTED_IDS")
     RUN_IDS_SOURCE="sampled"
     log "Sampled ${BOLD}${#IDS[@]}${RESET} run ID(s)."
@@ -426,15 +343,14 @@ if [[ ${#WANTED_NAMES[@]} -gt 0 ]]; then
     declare -A AVAIL=()
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
-        AVAIL["$f"]=1            # full path as listed
-        AVAIL["${f##*/}"]=1      # basename
+        AVAIL["$f"]=1            
+        AVAIL["${f##*/}"]=1      
     done <<< "$ALL_FILES"
 
-    # For each source file, keep it if its path or basename was requested.
     declare -A REQUESTED=()
     for name in "${WANTED_NAMES[@]}"; do
         REQUESTED["$name"]=1
-        REQUESTED["${name##*/}"]=1   # tolerate paths in the list file
+        REQUESTED["${name##*/}"]=1   
     done
 
     SELECTED=$(
@@ -447,9 +363,8 @@ if [[ ${#WANTED_NAMES[@]} -gt 0 ]]; then
     )
     SAMPLE_N=$(echo "$SELECTED" | grep -c . || true)
 
-    [[ "$SAMPLE_N" -eq 0 ]] && die "None of the ${#WANTED_NAMES[@]} listed file(s) were found in source."
+    [[ "$SAMPLE_N" -eq 0 ]] && die "None of the ${#WANTED_NAMES[@]} listed item(s) were found in source."
 
-    # Warn about listed entries that matched nothing in the source.
     missing=()
     for name in "${WANTED_NAMES[@]}"; do
         if [[ -z "${AVAIL[$name]:-}" && -z "${AVAIL[${name##*/}]:-}" ]]; then
@@ -458,15 +373,14 @@ if [[ ${#WANTED_NAMES[@]} -gt 0 ]]; then
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         if (( ${#missing[@]} <= 20 )); then
-            warn "Listed file(s) not found in source (${#missing[@]}): ${missing[*]}"
+            warn "Listed item(s) not found in source (${#missing[@]}): ${missing[*]}"
         else
-            warn "Listed file(s) not found in source: ${#missing[@]} of ${#WANTED_NAMES[@]} (first 20: ${missing[*]:0:20}…)"
+            warn "Listed item(s) not found in source: ${#missing[@]} of ${#WANTED_NAMES[@]} (first 20: ${missing[*]:0:20}…)"
         fi
     fi
 
-    log "Matched ${BOLD}${SAMPLE_N}${RESET} file(s) from the list of ${#WANTED_NAMES[@]}."
+    log "Matched ${BOLD}${SAMPLE_N}${RESET} item(s) from the list of ${#WANTED_NAMES[@]}."
 elif [[ ${#IDS[@]} -gt 0 ]]; then
-    # Build extended-regex alternation: id1|id2|id3 — escape any regex metas in IDs
     esc_ids=()
     for id in "${IDS[@]}"; do
         esc_ids+=("$(printf '%s' "$id" | sed -e 's/[][\\.^$*+?(){}|/]/\\&/g')")
@@ -476,24 +390,9 @@ elif [[ ${#IDS[@]} -gt 0 ]]; then
     SELECTED=$(echo "$ALL_FILES" | grep -E "$ID_RE" || true)
     SAMPLE_N=$(echo "$SELECTED" | grep -c . || true)
 
-    [[ "$SAMPLE_N" -eq 0 ]] && die "No files matched any of the ${#IDS[@]} run ID(s)."
-
-    missing=$(comm -23 \
-        <(printf '%s\n' "${IDS[@]}" | sort -u) \
-        <(echo "$matched_ids"))
-
-    if [[ -n "$missing" ]]; then
-        n_missing=$(echo "$missing" | grep -c .)
-        if (( n_missing <= 20 )); then
-            warn "Run IDs with no matching file ($n_missing): $(echo "$missing" | tr '\n' ' ')"
-        else
-            warn "Run IDs with no matching file: $n_missing of ${#IDS[@]} (first 20: $(echo "$missing" | head -20 | tr '\n' ' ')…)"
-        fi
-    fi
-
-    log "Matched ${BOLD}${SAMPLE_N}${RESET} file(s) for ${#IDS[@]} run ID(s)."
+    [[ "$SAMPLE_N" -eq 0 ]] && die "No items matched any of the ${#IDS[@]} run ID(s)."
+    log "Matched ${BOLD}${SAMPLE_N}${RESET} item(s) for ${#IDS[@]} run ID(s)."
 else
-    # Random-sample by count or fraction
     if [[ -n "$N_FILES" ]]; then
         SAMPLE_N="$N_FILES"
     else
@@ -504,18 +403,18 @@ else
         warn "Requested $SAMPLE_N but only $TOTAL available — using all."
         SAMPLE_N="$TOTAL"
     }
-    log "Sampling ${BOLD}${SAMPLE_N}${RESET} of ${TOTAL} file(s)."
+    log "Sampling ${BOLD}${SAMPLE_N}${RESET} of ${TOTAL} item(s)."
 
     SELECTED=$(echo "$ALL_FILES" | seeded_sample "$SEED" "$SAMPLE_N")
 fi
 
 if (( VERBOSE >= 2 )); then
-    log "Selected files:"
+    log "Selected items:"
     echo "$SELECTED" | while read -r f; do echo "  $f"; done
 fi
 
 # --------------------------------------------------------------------------- #
-# Transfer
+# Transfer (Modified for recursive / dir copying)
 # --------------------------------------------------------------------------- #
 TRANSFERRED=0
 FAILED=0
@@ -529,7 +428,6 @@ _exec() {
 transfer_file() {
     local file="$1"
 
-    # Construct source URI
     case "$SRC_TYPE" in
         local)  src_uri="$file" ;;
         ssh)    src_uri="${SOURCE%%:*}:$file" ;;
@@ -544,30 +442,31 @@ transfer_file() {
         return 0
     fi
 
-    # Choose transfer tool based on src/dst type combination
+    local CP_FLAGS=""
+    local LOCAL_XRD_OPTS="$XRDCP_OPTS"
+    if $DIRS_MODE; then
+        CP_FLAGS="-r"
+        LOCAL_XRD_OPTS="$LOCAL_XRD_OPTS -r"
+    fi
+
     if [[ "$SRC_TYPE" == "xrootd" || "$DST_TYPE" == "xrootd" ]]; then
-        # XRootD → anything or anything → XRootD
         local dst_uri
         case "$DST_TYPE" in
-            xrootd) dst_uri="${DEST%/}/$(basename "$file")" ;;
-            local)  dst_uri="${DEST%/}/$(basename "$file")" ;;
-            ssh)    dst_uri="${DEST}" ;;  # pipe through local for ssh dst
+            xrootd|local) dst_uri="${DEST%/}/$(basename "$file")" ;;
+            ssh)          dst_uri="${DEST}" ;;  
         esac
-        _exec xrdcp $XRDCP_OPTS "$src_uri" "$dst_uri"
+        _exec xrdcp $LOCAL_XRD_OPTS "$src_uri" "$dst_uri"
     elif [[ "$SRC_TYPE" == "local" && "$DST_TYPE" == "local" ]]; then
         mkdir -p "$DEST"
-        _exec cp "$file" "${DEST%/}/"
+        _exec cp $CP_FLAGS "$file" "${DEST%/}/"
     else
-        # SSH source or SSH dest: use rsync
         _exec rsync $RSYNC_OPTS "$src_uri" "$DEST"
     fi
 }
 
-# Decide presentation: progress bar only at level 0 and not during a dry-run.
 SHOW_BAR=false
 if (( VERBOSE == 0 )) && ! $DRY_RUN; then
     SHOW_BAR=true
-    # Silence per-file tool chatter so it doesn't fight the overall bar.
     RSYNC_OPTS="${RSYNC_OPTS//--progress/} -q"
     XRDCP_OPTS="$XRDCP_OPTS -s"
 fi
@@ -589,18 +488,16 @@ while IFS= read -r file; do
         TRANSFERRED=$((TRANSFERRED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) OK  $file" >> "$LOG_FILE"
     else
-        $SHOW_BAR && printf '\n' >&2   # break the bar line before the warning
+        $SHOW_BAR && printf '\n' >&2   
         warn "Failed: ${file##*/}"
         FAILED=$((FAILED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) ERR $file" >> "$LOG_FILE"
     fi
-
     DONE=$((DONE + 1))
     $SHOW_BAR && draw_progress "$DONE" "$SAMPLE_N" "$START_TIME"
 done <<< "$SELECTED"
 
 $SHOW_BAR && printf '\n' >&2
-
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
 
