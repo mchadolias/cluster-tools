@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# sample_transfer.sh — Random file/folder sampler & transfer for km3tipi
+# transfer_data.sh — Random file/folder sampler & transfer between devices
 #
-# Transfers a random sample of files (or directories) from a source to a dest.
-# Supports local paths, remote SSH hosts, and XRootD (dcache) endpoints.
+# Transfers a sample of files (or directories) from a source to a destination.
+# Supports local paths, remote SSH hosts, and XRootD (dCache) endpoints, in any
+# combination:
+#     local <-> local        (cp)
+#     local <-> ssh          (rsync over a multiplexed ssh connection)
+#     ssh   <-> ssh          (rsync executed on the source host)
+#     local <-> xrootd       (xrdcp)
+#     xrootd<-> xrootd       (xrdcp)
+#     ssh   <-> xrootd       (staged through a local temp dir)
 # =============================================================================
 
 set -euo pipefail
@@ -11,20 +18,22 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # Defaults
 # --------------------------------------------------------------------------- #
-N_FILES=""          
-FRACTION=""         
-N_RUNS=""           
-RUN_IDS=""          
-LIST_FILE=""        
-PATTERN="*"         
-SEED=""             
+N_FILES=""
+FRACTION=""
+N_RUNS=""
+RUN_IDS=""
+LIST_FILE=""
+PATTERN="*"
+SEED=""
 DRY_RUN=false
-VERBOSE=0           
+VERBOSE=0
 RECURSIVE=false
 DIRS_MODE=false
-RSYNC_OPTS="-az --progress"
-XRDCP_OPTS="--parallel 4"
 LOG_FILE=""
+
+# Transfer tool options, kept as arrays so they can be extended safely.
+RSYNC_ARGS=(-a -z --mkpath --progress)
+XRDCP_ARGS=(--parallel 4)
 
 # --------------------------------------------------------------------------- #
 # Colours
@@ -37,6 +46,8 @@ warn() { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 err()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 ok()   { echo -e "${GREEN}[OK]${RESET}    $*"; }
 die()  { err "$*"; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found in PATH."; }
 
 seeded_sample() {
     local seed="$1" n="$2"
@@ -112,23 +123,29 @@ draw_progress() {
 # --------------------------------------------------------------------------- #
 usage() {
 cat <<EOF
-${BOLD}sample_transfer.sh${RESET} — random file/folder sampler & transfer for km3tipi
+${BOLD}transfer_data.sh${RESET} — random file/folder sampler & transfer between devices
 
 ${BOLD}USAGE${RESET}
   $(basename "$0") [OPTIONS] <source> <destination>
+
+  Endpoints may be:
+    local path         /data/run/
+    ssh host           user@host:/data/run/   (or host:/data/run/)
+    xrootd (dcache)    root://server:1094//pnfs/data/run/
 
 ${BOLD}OPTIONS${RESET}
   -n, --count N        Transfer exactly N items
   -f, --fraction F     Transfer a fraction F of items, e.g. 0.10 for 10%
       --run N          Pick N distinct runs at random from the source
       --run-ids ARG    Transfer all items whose names contain a run ID
+                       (ARG is a START-END range or a file of IDs)
   -L, --list FILE      Transfer exactly the items listed in FILE
   -p, --pattern GLOB   Pattern to match, default: '*'
   -d, --dirs           Sample and transfer entire directories instead of files
   -s, --seed INT       Random seed for reproducibility
   -r, --recursive      Recurse into subdirectories (local/SSH sources)
       --dry-run        Print actions without executing transfers
-  -v, --verbose        Increase verbosity (repeatable).
+  -v, --verbose        Increase verbosity (repeatable)
   -l, --log FILE       Append transfer log to FILE
   -h, --help           Show this help
 EOF
@@ -174,6 +191,16 @@ n_modes=0
 (( n_modes == 0 )) && die "Specify selection with -n <count>, -f <fraction>, --run <N>, --run-ids <arg>, or --list <file>."
 (( n_modes >  1 )) && die "Use only one of -n / -f / --run / --run-ids / --list."
 
+if [[ -n "$N_FILES" ]]; then
+    [[ "$N_FILES" =~ ^[0-9]+$ && "$N_FILES" -gt 0 ]] \
+        || die "--count: expected a positive integer, got '$N_FILES'."
+fi
+
+if [[ -n "$FRACTION" ]]; then
+    [[ "$FRACTION" =~ ^0*(\.[0-9]+)?$|^1(\.0+)?$ ]] \
+        || die "--fraction: expected a value in (0,1], got '$FRACTION'."
+fi
+
 if [[ -n "$N_RUNS" ]]; then
     [[ "$N_RUNS" =~ ^[0-9]+$ && "$N_RUNS" -gt 0 ]] \
         || die "--run: expected a positive integer, got '$N_RUNS'."
@@ -192,21 +219,81 @@ if [[ -n "$RUN_IDS" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Detect source type
+# Detect endpoint type
+#   xrootd : root://...
+#   ssh    : [user@]host:path   (host part contains no '/' before the colon)
+#   local  : anything else. Prefix a local path with ./ if it contains a ':'.
 # --------------------------------------------------------------------------- #
 detect_type() {
     local path="$1"
-    if [[ "$path" == root://* ]]; then echo "xrootd"
-    elif [[ "$path" == *@*:* || "$path" == *:/* ]]; then echo "ssh"
-    else echo "local"
+    if [[ "$path" == root://* ]]; then
+        echo "xrootd"
+    elif [[ "$path" == *:* && "${path%%:*}" != */* && "${path%%:*}" != "$path" ]]; then
+        echo "ssh"
+    else
+        echo "local"
     fi
 }
+
+# Split an xrootd URL (root://host[:port]//path) into server + path.
+# Sets the named-by-caller globals via the two echoed lines.
+xrootd_split() {  # <url> -> prints "<server>\n<path>"
+    local url="${1#root://}"
+    [[ "$url" == *//* ]] || die "Malformed xrootd URL (expected root://host//path): $1"
+    local host="${url%%//*}"
+    local path="/${url#*//}"
+    printf 'root://%s\n%s\n' "$host" "$path"
+}
+
+# Convert a shell glob to an (unanchored) ERE for grep, as xrdfs has no glob.
+glob2re() { printf '%s' "${1//\*/.*}"; }
 
 SRC_TYPE=$(detect_type "$SOURCE")
 DST_TYPE=$(detect_type "$DEST")
 
 log "Source type : ${BOLD}${SRC_TYPE}${RESET}  →  ${SOURCE}"
 log "Dest type   : ${BOLD}${DST_TYPE}${RESET}  →  ${DEST}"
+
+# --------------------------------------------------------------------------- #
+# Dependency checks (only for the tools this run will actually use)
+# --------------------------------------------------------------------------- #
+need shuf
+[[ "$SRC_TYPE" == ssh || "$DST_TYPE" == ssh ]] && { need ssh; need rsync; }
+[[ "$SRC_TYPE" == local || "$DST_TYPE" == local ]] && need cp
+{ [[ "$SRC_TYPE" == xrootd || "$DST_TYPE" == xrootd ]]; } && { need xrdcp; need xrdfs; }
+# A staged ssh<->xrootd transfer needs both toolchains plus a local hop.
+if { [[ "$SRC_TYPE" == ssh && "$DST_TYPE" == xrootd ]] || \
+     [[ "$SRC_TYPE" == xrootd && "$DST_TYPE" == ssh ]]; }; then
+    need rsync; need ssh; need xrdcp
+fi
+
+# --------------------------------------------------------------------------- #
+# Pre-split xrootd endpoints (once)
+# --------------------------------------------------------------------------- #
+XR_SRC_SERVER=""; XR_SRC_PATH=""
+XR_DST_SERVER=""; XR_DST_PATH=""
+if [[ "$SRC_TYPE" == xrootd ]]; then
+    { read -r XR_SRC_SERVER; read -r XR_SRC_PATH; } < <(xrootd_split "$SOURCE")
+fi
+if [[ "$DST_TYPE" == xrootd ]]; then
+    { read -r XR_DST_SERVER; read -r XR_DST_PATH; } < <(xrootd_split "$DEST")
+fi
+
+# --------------------------------------------------------------------------- #
+# Temp dirs: one for the ssh control socket (connection multiplexing), one for
+# staging cross-protocol transfers. Both are cleaned up on exit.
+# --------------------------------------------------------------------------- #
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/transfer_data.XXXXXX")"
+SSH_MUX_DIR="$TMP_ROOT/mux"
+STAGE_DIR="$TMP_ROOT/stage"
+mkdir -p "$SSH_MUX_DIR" "$STAGE_DIR"
+cleanup() { rm -rf "$TMP_ROOT" 2>/dev/null || true; }
+trap cleanup EXIT
+
+# Multiplexed ssh: reuse a single TCP+auth connection for every file, which is
+# the main win when moving many small files over ssh.
+SSH_OPTS=(-o "ControlMaster=auto" -o "ControlPath=$SSH_MUX_DIR/%r@%h:%p" -o "ControlPersist=30")
+SSH_CMD="ssh ${SSH_OPTS[*]}"
 
 # --------------------------------------------------------------------------- #
 # Load run IDs (if given)
@@ -242,9 +329,9 @@ fi
 WANTED_NAMES=()
 if [[ -n "$LIST_FILE" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%%#*}"                              
-        line="${line#"${line%%[![:space:]]*}"}"         
-        line="${line%"${line##*[![:space:]]}"}"         
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
         [[ -n "$line" ]] && WANTED_NAMES+=("$line")
     done < "$LIST_FILE"
     [[ ${#WANTED_NAMES[@]} -eq 0 ]] && die "No filenames found in $LIST_FILE"
@@ -252,7 +339,7 @@ if [[ -n "$LIST_FILE" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# List items from source 
+# List items from source
 # --------------------------------------------------------------------------- #
 list_files() {
     local src="$1" type="$2"
@@ -262,7 +349,6 @@ list_files() {
     case "$type" in
         local)
             if $RECURSIVE; then
-                # Added -mindepth 1 to prevent selecting the parent directory itself
                 find "$src" -mindepth 1 -type "$item_type" -name "$PATTERN"
             else
                 find "$src" -mindepth 1 -maxdepth 1 -type "$item_type" -name "$PATTERN"
@@ -271,24 +357,20 @@ list_files() {
         ssh)
             local host="${src%%:*}"
             local path="${src#*:}"
-            if $RECURSIVE; then
-                ssh "$host" "find '$path' -mindepth 1 -type '$item_type' -name '$PATTERN'"
-            else
-                ssh "$host" "find '$path' -mindepth 1 -maxdepth 1 -type '$item_type' -name '$PATTERN'"
-            fi
+            local depth="-maxdepth 1"
+            $RECURSIVE && depth=""
+            ssh "${SSH_OPTS[@]}" "$host" \
+                "find '$path' -mindepth 1 $depth -type '$item_type' -name '$PATTERN'"
             ;;
         xrootd)
-            local server="${src%%//*}""//" 
-            local lpath="/${src#*//}"       
-            lpath="/${lpath#/}"
-            
+            local server="$XR_SRC_SERVER" lpath="$XR_SRC_PATH"
             if $DIRS_MODE; then
-                # xrdfs ls doesn't include the parent dir by default, so we just filter
-                xrdfs "${server%//}" ls -l "$lpath" 2>/dev/null \
-                    | awk '/^d/ {print $NF}' | grep -E "${PATTERN//\*/.*}" || true
+                # xrdfs ls doesn't include the parent dir; filter dir entries.
+                xrdfs "$server" ls -l "$lpath" 2>/dev/null \
+                    | awk '/^d/ {print $NF}' | grep -E "$(glob2re "$PATTERN")" || true
             else
-                xrdfs "${server%//}" ls "$lpath" 2>/dev/null \
-                    | grep -E "${PATTERN//\*/.*}" || true
+                xrdfs "$server" ls "$lpath" 2>/dev/null \
+                    | grep -E "$(glob2re "$PATTERN")" || true
             fi
             ;;
     esac
@@ -343,14 +425,14 @@ if [[ ${#WANTED_NAMES[@]} -gt 0 ]]; then
     declare -A AVAIL=()
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
-        AVAIL["$f"]=1            
-        AVAIL["${f##*/}"]=1      
+        AVAIL["$f"]=1
+        AVAIL["${f##*/}"]=1
     done <<< "$ALL_FILES"
 
     declare -A REQUESTED=()
     for name in "${WANTED_NAMES[@]}"; do
         REQUESTED["$name"]=1
-        REQUESTED["${name##*/}"]=1   
+        REQUESTED["${name##*/}"]=1
     done
 
     SELECTED=$(
@@ -387,7 +469,15 @@ elif [[ ${#IDS[@]} -gt 0 ]]; then
     done
     ID_RE=$(IFS='|'; echo "${esc_ids[*]}")
 
-    SELECTED=$(echo "$ALL_FILES" | grep -E "$ID_RE" || true)
+    # Match run IDs against the basename only — matching the full path would
+    # false-positive on digits in the leading directories.
+    SELECTED=$(
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            [[ "${f##*/}" =~ $ID_RE ]] && echo "$f"
+        done <<< "$ALL_FILES"
+        true   # keep the subshell's exit status 0 under set -e
+    )
     SAMPLE_N=$(echo "$SELECTED" | grep -c . || true)
 
     [[ "$SAMPLE_N" -eq 0 ]] && die "No items matched any of the ${#IDS[@]} run ID(s)."
@@ -414,62 +504,101 @@ if (( VERBOSE >= 2 )); then
 fi
 
 # --------------------------------------------------------------------------- #
-# Transfer (Modified for recursive / dir copying)
+# Transfer
 # --------------------------------------------------------------------------- #
 TRANSFERRED=0
 FAILED=0
 START_TIME=$(date +%s)
+
+SHOW_BAR=false
+if (( VERBOSE == 0 )) && ! $DRY_RUN; then
+    SHOW_BAR=true
+    _q=(); for _a in "${RSYNC_ARGS[@]}"; do [[ "$_a" == --progress ]] || _q+=("$_a"); done
+    RSYNC_ARGS=("${_q[@]}" -q); unset _q _a
+    XRDCP_ARGS+=(-s)
+fi
+$DIRS_MODE && XRDCP_ARGS+=(-r)
+
+if [[ "$DST_TYPE" == local ]]; then
+    mkdir -p "$DEST"
+fi
+
+WARNED_RR=false
 
 _exec() {
     (( VERBOSE >= 2 )) && log "  \$ $*"
     if $SHOW_BAR; then "$@" >/dev/null; else "$@"; fi
 }
 
-transfer_file() {
-    local file="$1"
+# ---- transfer primitives (each has at most one non-local endpoint) -------- #
 
+# Copy one local item into the local DEST directory.
+cp_local() {
+    local file="$1" flags=(-p)
+    $DIRS_MODE && flags+=(-r)
+    _exec cp "${flags[@]}" -- "$file" "${DEST%/}/"
+}
+
+# Pull one remote item (ssh|xrootd source) into a local destination directory.
+pull_to_local() {  # <file> <dstdir>
+    local file="$1" dstdir="$2" base="${file##*/}"
     case "$SRC_TYPE" in
-        local)  src_uri="$file" ;;
-        ssh)    src_uri="${SOURCE%%:*}:$file" ;;
-        xrootd)
-            local server="${SOURCE%%//*}//"
-            src_uri="${server}${file}"
-            ;;
+        ssh)    _exec rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "${SOURCE%%:*}:$file" "${dstdir%/}/" ;;
+        xrootd) mkdir -p "$dstdir"
+                _exec xrdcp "${XRDCP_ARGS[@]}" "${XR_SRC_SERVER}/${file}" "${dstdir%/}/$base" ;;
     esac
+}
+
+# Push one local item to the remote DEST (ssh|xrootd destination).
+push_from_local() {  # <localpath>
+    local lp="$1" base="${lp##*/}"
+    case "$DST_TYPE" in
+        ssh)    _exec rsync "${RSYNC_ARGS[@]}" -e "$SSH_CMD" "$lp" "${DEST%/}/" ;;
+        xrootd) _exec xrdcp "${XRDCP_ARGS[@]}" "$lp" "${XR_DST_SERVER}/${XR_DST_PATH%/}/$base" ;;
+    esac
+}
+
+# Direct xrootd->xrootd copy.
+xrdcp_xx() {  # <file>
+    local file="$1" base="${file##*/}"
+    _exec xrdcp "${XRDCP_ARGS[@]}" \
+        "${XR_SRC_SERVER}/${file}" "${XR_DST_SERVER}/${XR_DST_PATH%/}/$base"
+}
+
+rsync_rr() {  # <file>
+    local file="$1" srchost="${SOURCE%%:*}"
+    if ! $WARNED_RR; then
+        warn "ssh→ssh: rsync runs on '$srchost'; it must be able to reach '${DEST%%:*}'."
+        WARNED_RR=true
+    fi
+    _exec ssh "${SSH_OPTS[@]}" "$srchost" \
+        "rsync -az --mkpath -q -- '$file' '${DEST}'"
+}
+
+transfer_file() {
+    local file="$1" base="${file##*/}"
 
     if $DRY_RUN; then
-        echo "  [DRY-RUN] would transfer: $src_uri → $DEST"
+        echo "  [DRY-RUN] would transfer: ${SRC_TYPE}:${file} → ${DST_TYPE}:${DEST}"
         return 0
     fi
 
-    local CP_FLAGS=""
-    local LOCAL_XRD_OPTS="$XRDCP_OPTS"
-    if $DIRS_MODE; then
-        CP_FLAGS="-r"
-        LOCAL_XRD_OPTS="$LOCAL_XRD_OPTS -r"
-    fi
-
-    if [[ "$SRC_TYPE" == "xrootd" || "$DST_TYPE" == "xrootd" ]]; then
-        local dst_uri
-        case "$DST_TYPE" in
-            xrootd|local) dst_uri="${DEST%/}/$(basename "$file")" ;;
-            ssh)          dst_uri="${DEST}" ;;  
-        esac
-        _exec xrdcp $LOCAL_XRD_OPTS "$src_uri" "$dst_uri"
-    elif [[ "$SRC_TYPE" == "local" && "$DST_TYPE" == "local" ]]; then
-        mkdir -p "$DEST"
-        _exec cp $CP_FLAGS "$file" "${DEST%/}/"
-    else
-        _exec rsync $RSYNC_OPTS "$src_uri" "$DEST"
-    fi
+    case "${SRC_TYPE}:${DST_TYPE}" in
+        local:local)   cp_local "$file" ;;
+        local:*)       push_from_local "$file" ;;
+        *:local)       pull_to_local "$file" "$DEST" ;;
+        ssh:ssh)       rsync_rr "$file" ;;
+        xrootd:xrootd) xrdcp_xx "$file" ;;
+        *)  # cross-protocol remote↔remote (ssh↔xrootd): stage via local temp
+            local staged="$STAGE_DIR/$base"
+            rm -rf "$staged"
+            pull_to_local "$file" "$STAGE_DIR" && push_from_local "$staged"
+            local rc=$?
+            rm -rf "$staged"
+            return $rc
+            ;;
+    esac
 }
-
-SHOW_BAR=false
-if (( VERBOSE == 0 )) && ! $DRY_RUN; then
-    SHOW_BAR=true
-    RSYNC_OPTS="${RSYNC_OPTS//--progress/} -q"
-    XRDCP_OPTS="$XRDCP_OPTS -s"
-fi
 
 log "Starting transfer…"
 DONE=0
@@ -488,7 +617,7 @@ while IFS= read -r file; do
         TRANSFERRED=$((TRANSFERRED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) OK  $file" >> "$LOG_FILE"
     else
-        $SHOW_BAR && printf '\n' >&2   
+        $SHOW_BAR && printf '\n' >&2
         warn "Failed: ${file##*/}"
         FAILED=$((FAILED + 1))
         [[ -n "$LOG_FILE" ]] && echo "$(date -u +%FT%TZ) ERR $file" >> "$LOG_FILE"
